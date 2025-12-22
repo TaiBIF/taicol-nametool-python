@@ -1,0 +1,18 @@
+# docker-compose.yml
+services:
+  nametool-python:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nametool-python-service
+    ports:
+      - "127.0.0.1:8009:8009"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - FLASK_ENV=development  # 開發模式
+    volumes:
+      - ../taicol-2021/public/pdfs:/pdfs
+      - ../taicol-2021/public/usage_results:/usage_results
+      - ./prompts:/prompts
+      - .:/app  # 掛載整個原始碼目錄
+    command: python main.py  # 覆寫啟動指令
