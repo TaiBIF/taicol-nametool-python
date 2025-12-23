@@ -7,6 +7,7 @@
 * 若某欄位沒有資料，直接拿掉該欄位
 * 確保學名順序和文獻中一致，不得改變順序，並依據順序加上index欄位
 * 當欄位有提供允許清單時（指令有「包含」），僅能填入允許清單內的值，若不在允許清單內則留空
+* 特別注意必填欄位
 
 ### 對每個學名依序處理：
 
@@ -73,9 +74,8 @@
 json  [{
     "use": "holotype/lectotype/syntype等",
     "kind": "標本類型，若無法判斷統一回傳數字1"
-    "country": "採集國家",
+    "country": "採集國家，以英文回傳",
     "locality": "採集地點", 
-    "collectors": "採集者",
     "collection_year": 年份,
     "collection_month": 月份,
     "collection_day": 日期,
