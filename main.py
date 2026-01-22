@@ -193,14 +193,70 @@ def process_usage():
         with open("/prompts/usage.md", "r", encoding="utf-8") as f:
             prompt = f.read()
         
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=[prompt, uploaded_file],
-            config={
-                "response_mime_type": "application/json",
-                "response_json_schema": UsageResult.model_json_schema()
-            },  
-        )
+        # --- [ 503 重試機制 ] ---
+        response = None
+        retry_delay = 2       # 初始等待 2 秒
+        max_delay_cap = 30    # 等待上限 30 秒
+        max_total_timeout = 600 # 總共願意重試 10 分鐘
+        start_time = time.time()
+
+        while True:
+            try:
+                # 這裡移除了不支援的 timeout 參數
+                response = client.models.generate_content(
+                    model='gemini-2.5-flash',
+                    contents=[prompt, uploaded_file],
+                    config={
+                        "response_mime_type": "application/json",
+                        "response_json_schema": UsageResult.model_json_schema()
+                    }
+                )
+                break # 成功則跳出
+
+            except Exception as e:
+                # 判斷是否超過總等待時間
+                elapsed_time = time.time() - start_time
+                if elapsed_time > max_total_timeout:
+                    logger.error(f"Total processing time exceeded {max_total_timeout}s. Last error: {str(e)}")
+                    raise e
+
+                # 判斷錯誤類型
+                error_msg = str(e)
+                is_retryable = False
+
+                # 針對 503 (忙碌) 和 429 (配額不足) 進行重試
+                if "503" in error_msg or "Service Unavailable" in error_msg:
+                    logger.warning(f"Gemini 503 Service Unavailable.")
+                    is_retryable = True
+                
+                elif "429" in error_msg or "Resource exhausted" in error_msg:
+                    logger.warning(f"Gemini 429 Resource Exhausted.")
+                    is_retryable = True
+
+                elif "504" in error_msg or "Gateway Timeout" in error_msg:
+                    logger.warning(f"Gemini 504 Gateway Timeout.")
+                    is_retryable = True
+
+                if is_retryable:
+                    logger.warning(f"Retry triggered by error. Waiting {retry_delay}s... (Total elapsed: {int(elapsed_time)}s)")
+                    time.sleep(retry_delay)
+                    
+                    # 指數退避
+                    retry_delay = min(retry_delay * 2, max_delay_cap)
+                else:
+                    # 其他程式錯誤 (如 400 參數錯誤) 直接拋出
+                    logger.error(f"Non-retryable error: {str(e)}")
+                    raise e
+        # --------------------------------
+
+        # response = client.models.generate_content(
+        #     model='gemini-2.5-flash',
+        #     contents=[prompt, uploaded_file],
+        #     config={
+        #         "response_mime_type": "application/json",
+        #         "response_json_schema": UsageResult.model_json_schema()
+        #     },  
+        # )
 
         result = json.loads(response.text)
         with open(f'/usage_results/{uploaded_file.name}.json', 'w', encoding='utf-8') as f:
