@@ -16,3 +16,9 @@ services:
       - ./prompts:/prompts
       - .:/app  # 掛載整個原始碼目錄
     command: python main.py  # 覆寫啟動指令
+    deploy:
+      resources:
+        limits:
+          memory: 512M  # 給予較大的爆發空間
+        reservations:
+          memory: 128M  # 平時保留 128M 給它
