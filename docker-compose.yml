@@ -1,4 +1,7 @@
-# docker-compose.yml
+networks:
+  gateway:
+    external: true
+
 services:
   nametool-python:
     build:
@@ -22,3 +25,5 @@ services:
           memory: 512M  # 給予較大的爆發空間
         reservations:
           memory: 128M  # 平時保留 128M 給它
+    networks:
+      - gateway
