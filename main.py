@@ -3,9 +3,12 @@ from flask import Flask, request, jsonify
 import requests
 import os
 import time
+import hashlib
+import re
 import json
 import logging
 from google import genai
+from google.genai import errors as genai_errors
 from utils.usage import UsageResult
 
 app = Flask(__name__)
@@ -17,6 +20,13 @@ logger = logging.getLogger(__name__)
 # 初始化 Google GenAI 客戶端
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', 'your-api-key')
 client = genai.Client(api_key=GEMINI_API_KEY)
+
+# 使用的模型（改模型只需改 .env 並重建容器）
+GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-3.8-flash')
+
+# 測試用快取：off（預設，正常呼叫 AI）/ record（呼叫 AI 並存下結果）/ replay（有存過就直接回傳，不呼叫 AI）
+AI_CACHE_MODE = os.environ.get('AI_CACHE_MODE', 'off').lower()
+AI_CACHE_DIR = os.environ.get('AI_CACHE_DIR', '/ai_cache')
 
 
 # 定義結構化輸出的 schema
@@ -73,229 +83,270 @@ REFERENCE_SCHEMA = {
             "enum": ["en-us", "zh-tw", "jp-jp", "zh-cn", "de-de", "fr-fr", "lat", "others"]
         }
     },
-    "required": ["type", "title"]
+    # author、published 設為必填：新版模型對非必填欄位較容易直接省略
+    "required": ["type", "title", "author", "published"]
 }
 
 @app.get("/health")
 def health_check():
     return {"status": "healthy"}
 
+class AiModelError(Exception):
+    """非 APIError 但屬於模型端的失敗（檔案處理失敗、回應被截斷/阻擋/無法解析）"""
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        self.code = code
+
+
+def error_response(e):
+    if isinstance(e, genai_errors.APIError):
+        return jsonify({
+            'success': False,
+            'error_type': 'ai_model',
+            'error_code': e.code,       # 429 / 503 / 504 / 400...
+            'error_status': e.status,   # RESOURCE_EXHAUSTED 等
+            'error': e.message or str(e),
+        }), 502
+    if isinstance(e, AiModelError):
+        return jsonify({
+            'success': False,
+            'error_type': 'ai_model',
+            'error_code': e.code,
+            'error': str(e),
+        }), 502
+    return jsonify({'success': False, 'error_type': 'internal', 'error': str(e)}), 500
+
+
+def upload_and_wait(file_path):
+    logger.info(f"Uploading to Gemini: {file_path}")
+    uploaded_file = client.files.upload(file='/pdfs/' + file_path)
+
+    while uploaded_file.state.name == "PROCESSING":
+        time.sleep(2)
+        uploaded_file = client.files.get(name=uploaded_file.name)
+
+    if uploaded_file.state.name == "FAILED":
+        raise AiModelError(f"File processing failed: {uploaded_file.error.message}", 'FILE_FAILED')
+
+    logger.info(f"File {uploaded_file.name} is now in state: {uploaded_file.state.name}")
+    return uploaded_file
+
+
+RETRYABLE_CODES = (429, 503, 504)
+
+
+def quota_retry_delay(e):
+    """
+    解析 429 的額度資訊
+    回傳 (是否為每日額度用完, Gemini 建議的等待秒數或 None)
+    """
+    text = f"{getattr(e, 'details', '')} {getattr(e, 'message', '')} {e}"
+    is_daily = 'PerDay' in text
+    match = re.search(r"retryDelay['\"]?\s*[:=]\s*['\"]?(\d+(?:\.\d+)?)s", text)
+    delay = float(match.group(1)) if match else None
+    return is_daily, delay
+
+
+def generate_with_retry(contents, schema, max_total_timeout):
+    """
+    針對 429 / 503 / 504 做指數退避重試
+    429 額度問題：每日額度用完、或建議等待時間超過剩餘重試時間 → 不重試，直接回報
+    """
+    retry_delay = 2
+    max_delay_cap = 30
+    start_time = time.time()
+
+    while True:
+        try:
+            return client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=contents,
+                config={
+                    "response_mime_type": "application/json",
+                    "response_json_schema": schema,
+                },
+            )
+        except genai_errors.APIError as e:
+            elapsed_time = time.time() - start_time
+            if e.code not in RETRYABLE_CODES:
+                logger.error(f"Non-retryable Gemini error: {e}")
+                raise
+
+            wait = retry_delay
+            if e.code == 429:
+                is_daily, suggested = quota_retry_delay(e)
+                if is_daily:
+                    logger.error(f"Gemini daily quota exhausted, not retrying: {e}")
+                    raise
+                if suggested is not None:
+                    # 依 Gemini 建議的時間等待（例如每分鐘上限）
+                    wait = suggested
+                    if elapsed_time + wait > max_total_timeout:
+                        logger.error(f"Gemini suggested retry in {int(wait)}s exceeds timeout, not retrying: {e}")
+                        raise
+
+            if elapsed_time + wait > max_total_timeout:
+                logger.error(f"Retry timeout ({max_total_timeout}s) exceeded. Last error: {e}")
+                raise
+            logger.warning(f"Gemini {e.code}, retry in {int(wait)}s (elapsed {int(elapsed_time)}s)")
+            time.sleep(wait)
+            retry_delay = min(retry_delay * 2, max_delay_cap)
+
+
+def parse_response(response):
+    """檢查回應是否完整，並轉成 dict"""
+    feedback = getattr(response, 'prompt_feedback', None)
+    if feedback and getattr(feedback, 'block_reason', None):
+        raise AiModelError(f"Prompt blocked: {feedback.block_reason}", 'BLOCKED')
+
+    candidates = getattr(response, 'candidates', None) or []
+    finish_reason = getattr(candidates[0], 'finish_reason', None) if candidates else None
+    reason = getattr(finish_reason, 'name', str(finish_reason)) if finish_reason else None
+
+    if reason == 'MAX_TOKENS':
+        raise AiModelError("Response truncated (MAX_TOKENS)", 'MAX_TOKENS')
+    if reason in ('SAFETY', 'RECITATION', 'PROHIBITED_CONTENT', 'BLOCKLIST', 'SPII'):
+        raise AiModelError(f"Response blocked: {reason}", 'SAFETY')
+
+    if not response.text:
+        raise AiModelError(f"Empty response (finish_reason={reason})", 'INVALID_JSON')
+    try:
+        return json.loads(response.text)
+    except json.JSONDecodeError as e:
+        raise AiModelError(f"Invalid JSON from model: {e}", 'INVALID_JSON')
+
+
+def get_usage_metadata(response):
+    um = getattr(response, 'usage_metadata', None)
+    return {
+        'tokens_used': getattr(um, 'total_token_count', None),
+        'input_tokens': getattr(um, 'prompt_token_count', None),
+        'output_tokens': getattr(um, 'candidates_token_count', None),
+    }
+
+
+def delete_file_quietly(uploaded_file):
+    if uploaded_file is None:
+        return
+    try:
+        client.files.delete(name=uploaded_file.name)
+    except Exception:
+        pass
+
+
+# ---------- 測試用快取 ----------
+def cache_key(file_path, kind):
+    """以 PDF 內容的雜湊值當作快取 key（同一份 PDF 重新上傳、檔名不同也能命中）"""
+    with open('/pdfs/' + file_path, 'rb') as f:
+        digest = hashlib.sha256(f.read()).hexdigest()
+    return f"{kind}_{digest}"
+
+
+def cache_load(key):
+    if AI_CACHE_MODE != 'replay':
+        return None
+    path = os.path.join(AI_CACHE_DIR, key + '.json')
+    if not os.path.exists(path):
+        logger.info(f"[AI cache] miss: {key}")
+        return None
+    logger.info(f"[AI cache] hit: {key}（未呼叫 AI）")
+    with open(path, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+
+def cache_save(key, payload):
+    if AI_CACHE_MODE not in ('record', 'replay'):
+        return
+    os.makedirs(AI_CACHE_DIR, exist_ok=True)
+    with open(os.path.join(AI_CACHE_DIR, key + '.json'), 'w', encoding='utf-8') as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    logger.info(f"[AI cache] saved: {key}")
+
+
 @app.route('/process-reference', methods=['POST'])
 def process_reference():
+    uploaded_file = None
     try:
-        data = request.get_json()
-        file_path = data.get('file_path')
-        
-        logger.info(f"Processing PDF: {file_path}")
-            
-        # 使用 google-genai 上傳檔案
-        logger.info("Uploading to Gemini...")
-        # file_path = '/pdfs/references/tai.2024.69.302_20251210.pdf'
-        uploaded_file = client.files.upload(file='/pdfs/' + file_path)
+        file_path = request.get_json().get('file_path')
+        logger.info(f"Processing reference PDF: {file_path}")
 
-        logger.info(f"File uploaded with URI: {uploaded_file}")
-                
-        # Check the file status and wait until it is ACTIVE
-        while uploaded_file.state.name == "PROCESSING":
-            print('.', end='', flush=True)
-            time.sleep(2) # Wait for 5 seconds before re-checking
-            # Re-fetch the file metadata to get the current state
-            uploaded_file = client.files.get(name=uploaded_file.name)
+        key = cache_key(file_path, 'reference')
+        cached = cache_load(key)
+        if cached:
+            return jsonify({'success': True, **cached}), 200
 
-        if uploaded_file.state.name == "FAILED":
-            raise ValueError(f"File processing failed: {uploaded_file.error.message}")
+        uploaded_file = upload_and_wait(file_path)
 
-        print(f"\nFile {uploaded_file.name} is now in state: {uploaded_file.state.name}")
-        
-        logger.info("Generating content...")
-
-        # 生成內容
         with open("/prompts/reference.md", "r", encoding="utf-8") as f:
             prompt = f.read()
-        
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=[prompt, uploaded_file],
-            config={
-                "response_mime_type": "application/json",
-                "response_json_schema": REFERENCE_SCHEMA,
-            },  
-        )
 
-        result = json.loads(response.text)
+        # 同步請求，重試時間不宜過長（Laravel 端 timeout 600s）
+        response = generate_with_retry([prompt, uploaded_file], REFERENCE_SCHEMA, max_total_timeout=60)
+        result = parse_response(response)
 
-        # 取得 usage metadata
-        tokens_used = None
-        input_tokens = None
-        output_tokens = None
-        
-        if hasattr(response, 'usage_metadata'):
-            tokens_used = getattr(response.usage_metadata, 'total_token_count', None)
-            input_tokens = getattr(response.usage_metadata, 'prompt_token_count', None)
-            output_tokens = getattr(response.usage_metadata, 'candidates_token_count', None)
+        # 記錄解析結果，方便排查欄位缺漏（不需重新呼叫 AI）
+        logger.info("Reference result: %s", json.dumps(result, ensure_ascii=False)[:3000])
 
-        # 清理 Gemini 檔案
-        try:
-            client.files.delete(name=uploaded_file.name)
-        except:
-            pass
-        
-        logger.info("Processing completed successfully")
-        
-        return jsonify({
-            'success': True, 
+        payload = {
             'result': result,
-            'metadata': {
-                'tokens_used': tokens_used,
-                'input_tokens': input_tokens,
-                'output_tokens': output_tokens
-            },
-            'file_uri': uploaded_file.name
-        }), 200
-                        
+            'metadata': get_usage_metadata(response),
+            'file_uri': uploaded_file.name,
+        }
+        cache_save(key, payload)
+
+        logger.info("Processing completed successfully")
+        return jsonify({'success': True, **payload}), 200
+
     except Exception as e:
         logger.error(f"Error processing PDF: {str(e)}")
-        return jsonify({
-            'success': False, 
-            'error': str(e)
-        }), 500
-    
+        return error_response(e)
+    finally:
+        delete_file_quietly(uploaded_file)
+
 
 @app.route('/process-usage', methods=['POST'])
 def process_usage():
+    uploaded_file = None
     try:
-        data = request.get_json()
-        file_path = data.get('file_path')
-        
-        logger.info(f"Processing PDF: {file_path}")
-            
-        # 使用 google-genai 上傳檔案
-        logger.info("Uploading to Gemini...")
-        uploaded_file = client.files.upload(file='/pdfs/' + file_path)
+        file_path = request.get_json().get('file_path')
+        logger.info(f"Processing usage PDF: {file_path}")
 
-        logger.info(f"File uploaded with URI: {uploaded_file}")
-                
-        # Check the file status and wait until it is ACTIVE
-        while uploaded_file.state.name == "PROCESSING":
-            print('.', end='', flush=True)
-            time.sleep(2) # Wait for 5 seconds before re-checking
-            # Re-fetch the file metadata to get the current state
-            uploaded_file = client.files.get(name=uploaded_file.name)
+        key = cache_key(file_path, 'usage')
+        cached = cache_load(key)
+        if cached:
+            # 重新寫出結果檔，Laravel 端照常讀取
+            file_uri = f"cache/{key}"
+            os.makedirs('/usage_results/cache', exist_ok=True)
+            with open(f'/usage_results/{file_uri}.json', 'w', encoding='utf-8') as f:
+                json.dump(cached['result'], f, ensure_ascii=False, indent=2)
+            return jsonify({'success': True, 'metadata': cached.get('metadata', {}), 'file_uri': file_uri}), 200
 
-        if uploaded_file.state.name == "FAILED":
-            raise ValueError(f"File processing failed: {uploaded_file.error.message}")
+        uploaded_file = upload_and_wait(file_path)
 
-        print(f"\nFile {uploaded_file.name} is now in state: {uploaded_file.state.name}")
-        
-        logger.info("Generating content...")
-
-        # 生成內容
         with open("/prompts/usage.md", "r", encoding="utf-8") as f:
             prompt = f.read()
-        
-        # --- [ 503 重試機制 ] ---
-        response = None
-        retry_delay = 2       # 初始等待 2 秒
-        max_delay_cap = 30    # 等待上限 30 秒
-        max_total_timeout = 600 # 總共願意重試 10 分鐘
-        start_time = time.time()
 
-        while True:
-            try:
-                # 這裡移除了不支援的 timeout 參數
-                response = client.models.generate_content(
-                    model='gemini-2.5-flash',
-                    contents=[prompt, uploaded_file],
-                    config={
-                        "response_mime_type": "application/json",
-                        "response_json_schema": UsageResult.model_json_schema()
-                    }
-                )
-                break # 成功則跳出
+        response = generate_with_retry([prompt, uploaded_file], UsageResult.model_json_schema(), max_total_timeout=600)
+        result = parse_response(response)
 
-            except Exception as e:
-                # 判斷是否超過總等待時間
-                elapsed_time = time.time() - start_time
-                if elapsed_time > max_total_timeout:
-                    logger.error(f"Total processing time exceeded {max_total_timeout}s. Last error: {str(e)}")
-                    raise e
-
-                # 判斷錯誤類型
-                error_msg = str(e)
-                is_retryable = False
-
-                # 針對 503 (忙碌) 和 429 (配額不足) 進行重試
-                if "503" in error_msg or "Service Unavailable" in error_msg:
-                    logger.warning(f"Gemini 503 Service Unavailable.")
-                    is_retryable = True
-                
-                elif "429" in error_msg or "Resource exhausted" in error_msg:
-                    logger.warning(f"Gemini 429 Resource Exhausted.")
-                    is_retryable = True
-
-                elif "504" in error_msg or "Gateway Timeout" in error_msg:
-                    logger.warning(f"Gemini 504 Gateway Timeout.")
-                    is_retryable = True
-
-                if is_retryable:
-                    logger.warning(f"Retry triggered by error. Waiting {retry_delay}s... (Total elapsed: {int(elapsed_time)}s)")
-                    time.sleep(retry_delay)
-                    
-                    # 指數退避
-                    retry_delay = min(retry_delay * 2, max_delay_cap)
-                else:
-                    # 其他程式錯誤 (如 400 參數錯誤) 直接拋出
-                    logger.error(f"Non-retryable error: {str(e)}")
-                    raise e
-        # --------------------------------
-
-        # response = client.models.generate_content(
-        #     model='gemini-2.5-flash',
-        #     contents=[prompt, uploaded_file],
-        #     config={
-        #         "response_mime_type": "application/json",
-        #         "response_json_schema": UsageResult.model_json_schema()
-        #     },  
-        # )
-
-        result = json.loads(response.text)
         with open(f'/usage_results/{uploaded_file.name}.json', 'w', encoding='utf-8') as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
 
-        # 取得 usage metadata
-        tokens_used = None
-        input_tokens = None
-        output_tokens = None
-        
-        if hasattr(response, 'usage_metadata'):
-            tokens_used = getattr(response.usage_metadata, 'total_token_count', None)
-            input_tokens = getattr(response.usage_metadata, 'prompt_token_count', None)
-            output_tokens = getattr(response.usage_metadata, 'candidates_token_count', None)
+        cache_save(key, {'result': result, 'metadata': get_usage_metadata(response)})
 
-        # 清理 Gemini 檔案
-        try:
-            client.files.delete(name=uploaded_file.name)
-        except:
-            pass
-        
         logger.info("Processing completed successfully")
-
         return jsonify({
-            'success': True, 
-            'metadata': {
-                'tokens_used': tokens_used,
-                'input_tokens': input_tokens,
-                'output_tokens': output_tokens
-            },
+            'success': True,
+            'metadata': get_usage_metadata(response),
             'file_uri': uploaded_file.name
         }), 200
-                        
+
     except Exception as e:
         logger.error(f"Error processing PDF: {str(e)}")
-        return jsonify({
-            'success': False, 
-            'error': str(e)
-        }), 500
+        return error_response(e)
+    finally:
+        delete_file_quietly(uploaded_file)
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8009, debug=True)

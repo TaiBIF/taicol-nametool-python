@@ -107,7 +107,8 @@ class ScientificName(BaseModel):
     s2_rank: Optional[str] = Field(None, description="種下階層(如 var.、subsp.等)")
     latin_s2: Optional[str] = Field(None, description="種下名的epithet (infraspecies epithet)。")
 
-    formatted_authors: Optional[str] = Field(None, description="作者，不含狀態指示詞")
+    formatted_authors: Optional[str] = Field(None, description="作者，依文獻原樣保留括號作者（如 (L.) DC.、(Linnaeus, 1758)），不含狀態指示詞")
+    kingdom: Optional[str] = Field(None, description="生物界，僅能填入允許清單內的值")
     indications: Optional[List[str]] = Field(None, description="狀態指示詞列表")
     status: StatusEnum = Field(description="學名地位")
     is_indent: Literal[0, 1] = Field(description="縮排值：0或1")
@@ -132,7 +133,7 @@ class ScientificName(BaseModel):
     is_endemic: Optional[Literal[0, 1]] = Field(None, description="是否台灣特有")
     
     # 存在於台灣（特殊規則：屬以上為2，種以下為0或1）
-    is_in_taiwan: Optional[Literal[0, 1, 2]] = Field(None, description="存在於台灣：0=不存在，1=存在，2=屬以上階層")
+    is_in_taiwan: Optional[Literal[0, 1, 2]] = Field(None, description="存在於台灣：0=不存在，1=存在，2=屬以上階層或全文未提及台灣而無法判斷")
     
     # 描述欄位
     distribution: Optional[str] = Field(None, description="完整分布描述文字")

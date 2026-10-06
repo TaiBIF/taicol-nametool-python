@@ -86,6 +86,10 @@
 * `s2_rank`: (String) 種下階層連接詞 (如 var., subsp. 等)。(注意：ICZN 法規的 subsp. 需省略)。
 * `latin_s2`: (String) 種下名 (infraspecies epithet)。
 * `formatted_authors`: (String) 僅包含作者，不含狀態指示詞。
+    * **括號作者必須保留**：非基礎名（新組合、地位變更等）的作者常以括號標示原始作者，必須**完整依文獻原樣**保留括號與其內容，不可省略或改寫。
+        * ICN 範例：`Chamaecyparis obtusa var. formosana (Hayata) Rehder` 的作者為 `(Hayata) Rehder`。
+        * ICZN 範例：`Hyla chinensis (Günther, 1858)` → `(Günther, 1858)`；年份在括號內時須一併保留。
+    * 若同一學名在文中多處出現且作者寫法不同，以**分類處理區塊中該學名標題行**的寫法為準。
 * `kingdom`: (String) 生物界。
     * 允許清單： `Plantae`, `Animalia`, `Chromista`, `Fungi`, `Protozoa`, `Archaea`, `Bacteria`, `Eubacteria`, `Archaebacteria`, `Nucleariae`, `Zilligvirae`, `Heunggongvirae`, `Loebvirae`, `Sangervirae`, `Shotokuvirae`, `Trapavirae`, `Orthornavirae`, `Pararnavirae`, `Bamfordvirae`, `Helvetiavirae`, `Viruses`.
 * `indications`: (Array of Strings) 狀態指示詞列表。
@@ -178,6 +182,7 @@
 * `is_in_taiwan`: (Integer) 存在於臺灣。
     * 特殊規則：
         * 填入 2：階層為**屬以上（含屬本身）**。
+        * **填入 2（全文未提及台灣）**：若整篇文獻（含標題、摘要、內文、標本引用、表格）**完全沒有**出現「Taiwan」、「臺灣」、「台灣」、「Formosa」或任何台灣地名，則**所有學名**的 `is_in_taiwan` 一律填 `2`，不得填 0 或 1，也不得移除欄位。
     * 嚴格判斷流程 (針對種及種下階層)：
         1. 先確認該學名是否有明確的「分布段落 (Distribution)」。
         2. **填入 1**：必須滿足以下任一條件：
@@ -203,4 +208,6 @@
 * `latin_name` 是否已移除作者及 "sp." 等字樣？
 * `status`, `rank`, `nomenclature`, `kingdom` 是否填入允許清單內的值？
 * `is_in_taiwan` 是否符合嚴格判斷標準？
+* 若全文未提及台灣，是否所有學名的 `is_in_taiwan` 都已填 `2`？
+* 非基礎名的 `formatted_authors` 是否保留了括號作者？
 * `indications` 是否僅包含允許清單內的詞？
